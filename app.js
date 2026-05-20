@@ -88,6 +88,11 @@ const btnSpeaker     = $('#btnSpeaker');
   bindEvents();
   autoResizeTextarea();
   waLink.href = WA_LINK;
+  // تحميل أصوات المتصفح مبكراً
+  if (window.speechSynthesis) {
+    window.speechSynthesis.getVoices();
+    window.speechSynthesis.onvoiceschanged = () => {};
+  }
   setTimeout(() => typeWelcomeText(), 300);
 })();
 
@@ -271,7 +276,6 @@ function createStreamingBubble() {
   scrollToBottom();
 }
 
-// ─── أثناء الـ Stream: تحديث النص الخام بسرعة بدون renderMarkdown ──────────
 function updateStreamBubble(text) {
   const el = $('#streamBubble');
   if (!el) return;
@@ -283,7 +287,6 @@ function updateStreamBubble(text) {
   scrollToBottom();
 }
 
-// ─── بعد انتهاء الـ Stream: تطبيق renderMarkdown مرة واحدة فقط ─────────────
 function finalizeStreamBubble(text, msgId) {
   const row = $('#streamRow');
   if (!row) return;
@@ -357,7 +360,6 @@ async function sendMessage(customText) {
         model: 'openai', stream: true,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          // ─── إرسال آخر 8 رسائل فقط لتقليل الـ Payload وتسريع الاستجابة ───
           ...session.messages.slice(-8).map(m => ({ role: m.role, content: m.content }))
         ]
       })
@@ -444,7 +446,7 @@ function endCall() {
   callActive = false;
   stopCallTimer();
   stopCallListening();
-  // ─── إيقاف صوت Pollinations TTS إن كان يعمل ───
+  window.speechSynthesis.cancel();
   if (currentCallAudio) {
     currentCallAudio.pause();
     currentCallAudio.src = '';
@@ -559,48 +561,135 @@ async function fetchAIForCall(messages) {
   return await readStream(res, () => {});
 }
 
-// ─── Pollinations TTS — صوت المكالمة ─────────────────────────────────────────
+// ════════════════════════════════════════════════════
+//  TTS — نظام الصوت المحسَّن (Web Speech API + Fallback)
+// ════════════════════════════════════════════════════
+
+// ─── اختيار أفضل صوت عربي من المتصفح ────────────────────────────────────────
+function getArabicVoice() {
+  const voices = window.speechSynthesis.getVoices();
+  return (
+    voices.find(v => v.name.includes('Hoda'))                              // Microsoft Hoda — أفضل صوت
+    || voices.find(v => v.name.includes('Naayf'))                          // Microsoft Naayf
+    || voices.find(v => v.lang === 'ar-EG' && !v.name.includes('Google')) // ar-EG غير Google
+    || voices.find(v => v.lang === 'ar-SA' && !v.name.includes('Google')) // ar-SA غير Google
+    || voices.find(v => v.lang.startsWith('ar'))                           // أي صوت عربي
+    || null
+  );
+}
+
+// ─── Pollinations كـ Fallback فقط ────────────────────────────────────────────
+function _pollinationsSpeak(cleanText, resolve) {
+  const audio = new Audio(
+    `https://tts.pollinations.ai/?text=${encodeURIComponent(cleanText)}&voice=shimmer&language=ar`
+  );
+  audio.onended = () => resolve();
+  audio.onerror = () => resolve();
+  audio.play().catch(() => resolve());
+}
+
+// ─── محرك الصوت الأساسي — Web Speech API مع Fallback تلقائي ──────────────────
+function speakViaSynthesis(text, { rate = 1.0, pitch = 1.05, volume = 1.0 } = {}) {
+  return new Promise((resolve) => {
+    window.speechSynthesis.cancel();
+    const clean = cleanTextForTTS(text);
+    if (!clean) { resolve(); return; }
+
+    const utter = new SpeechSynthesisUtterance(clean);
+    utter.lang   = 'ar-EG';
+    utter.rate   = rate;
+    utter.pitch  = pitch;
+    utter.volume = volume;
+
+    const voice = getArabicVoice();
+    if (voice) utter.voice = voice;
+
+    let started = false;
+
+    // إذا لم يبدأ الكلام خلال 3 ثوانٍ → Fallback لـ Pollinations
+    const fallbackTimer = setTimeout(() => {
+      if (!started) {
+        window.speechSynthesis.cancel();
+        _pollinationsSpeak(clean, resolve);
+      }
+    }, 3000);
+
+    utter.onstart = () => { started = true; clearTimeout(fallbackTimer); };
+    utter.onend   = () => { clearTimeout(fallbackTimer); resolve(); };
+    utter.onerror = () => { clearTimeout(fallbackTimer); resolve(); };
+
+    window.speechSynthesis.speak(utter);
+  });
+}
+
+// ─── صوت رسائل الشات (زر استمع) ─────────────────────────────────────────────
+function speakText(text, btn) {
+  // إذا كان صوت شغّال → وقّفه
+  if (isSpeaking) {
+    window.speechSynthesis.cancel();
+    if (currentChatAudio) { currentChatAudio.pause(); currentChatAudio.src = ''; currentChatAudio = null; }
+    const prevBtn = window._speakActiveBtn;
+    isSpeaking = false;
+    document.querySelectorAll('.speak-btn.speaking').forEach(b => {
+      b.textContent = '🔊 استمع'; b.classList.remove('speaking');
+    });
+    if (prevBtn === btn) return; // Toggle off — نفس الزر
+  }
+
+  isSpeaking = true;
+  window._speakActiveBtn = btn;
+  btn.textContent = '⏹ إيقاف';
+  btn.classList.add('speaking');
+
+  const onEnd = () => {
+    isSpeaking = false;
+    window._speakActiveBtn = null;
+    btn.textContent = '🔊 استمع';
+    btn.classList.remove('speaking');
+  };
+
+  const trySpeak = () => {
+    speakViaSynthesis(text, { rate: 1.0, pitch: 1.05, volume: 1.0 }).then(onEnd);
+  };
+
+  // تأكد أن أصوات المتصفح محمّلة
+  if (window.speechSynthesis.getVoices().length === 0) {
+    window.speechSynthesis.onvoiceschanged = () => {
+      window.speechSynthesis.onvoiceschanged = null;
+      trySpeak();
+    };
+  } else {
+    trySpeak();
+  }
+}
+
+// ─── صوت المكالمة الصوتية ────────────────────────────────────────────────────
 function speakCallText(text) {
   return new Promise((resolve) => {
-    // إيقاف أي صوت سابق
-    if (currentCallAudio) {
-      currentCallAudio.pause();
-      currentCallAudio.src = '';
-      currentCallAudio = null;
-    }
+    window.speechSynthesis.cancel();
+    if (currentCallAudio) { currentCallAudio.pause(); currentCallAudio.src = ''; currentCallAudio = null; }
 
-    const cleanText = cleanTextForTTS(text);
-    if (!cleanText) { resolve(); return; }
+    const done = () => {
+      animateCallAvatar(false);
+      setWaveMode('idle');
+      resolve();
+    };
 
-    const audio = new Audio(
-      `https://tts.pollinations.ai/?text=${encodeURIComponent(cleanText)}&voice=ar-EG`
-    );
-    currentCallAudio = audio;
-
-    audio.onplay = () => {
+    const trySpeak = () => {
       setWaveMode('speaking');
       setCallStatus('🤖 السعيد يتحدث...');
       animateCallAvatar(true);
+      speakViaSynthesis(text, { rate: 1.05, pitch: 1.05, volume: 1.0 }).then(done);
     };
 
-    audio.onended = () => {
-      currentCallAudio = null;
-      animateCallAvatar(false);
-      setWaveMode('idle');
-      resolve();
-    };
-
-    audio.onerror = () => {
-      currentCallAudio = null;
-      animateCallAvatar(false);
-      setWaveMode('idle');
-      resolve();
-    };
-
-    audio.play().catch(() => {
-      currentCallAudio = null;
-      resolve();
-    });
+    if (window.speechSynthesis.getVoices().length === 0) {
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.onvoiceschanged = null;
+        trySpeak();
+      };
+    } else {
+      trySpeak();
+    }
   });
 }
 
@@ -655,70 +744,14 @@ function stopCallTimer() {
   callTimerEl.textContent = '00:00';
 }
 
-// ─── Pollinations TTS — صوت رسائل الشات (زر استمع) ──────────────────────────
-function speakText(text, btn) {
-  // إذا كان هناك صوت يعمل، أوقفه
-  if (isSpeaking) {
-    const prevBtn = currentChatAudio?._btn;
-    if (currentChatAudio) {
-      currentChatAudio.pause();
-      currentChatAudio.src = '';
-    }
-    currentChatAudio = null;
-    isSpeaking = false;
-    document.querySelectorAll('.speak-btn.speaking').forEach(b => {
-      b.textContent = '🔊 استمع'; b.classList.remove('speaking');
-    });
-    // إذا الضغطة على نفس الزر → فقط إيقاف (Toggle Off)
-    if (prevBtn === btn) return;
-  }
-
-  const cleanText = cleanTextForTTS(text);
-  if (!cleanText) return;
-
-  const audio = new Audio(
-    `https://tts.pollinations.ai/?text=${encodeURIComponent(cleanText)}&voice=ar-EG`
-  );
-  audio._btn = btn;
-  currentChatAudio = audio;
-
-  audio.onplay = () => {
-    isSpeaking = true;
-    btn.textContent = '⏹ إيقاف';
-    btn.classList.add('speaking');
-  };
-
-  audio.onended = () => {
-    isSpeaking = false;
-    currentChatAudio = null;
-    btn.textContent = '🔊 استمع';
-    btn.classList.remove('speaking');
-  };
-
-  audio.onerror = () => {
-    isSpeaking = false;
-    currentChatAudio = null;
-    btn.textContent = '🔊 استمع';
-    btn.classList.remove('speaking');
-  };
-
-  audio.play().catch(() => {
-    isSpeaking = false;
-    currentChatAudio = null;
-  });
-}
-
-// ─── تنظيف النص للـ TTS: إزالة الإيموجيز والرموز الغريبة ─────────────────────
+// ─── تنظيف النص للـ TTS ───────────────────────────────────────────────────────
 function cleanTextForTTS(text) {
   return stripMarkdown(text)
-    // إزالة الإيموجيز (Emoji Unicode ranges)
     .replace(/[\u{1F000}-\u{1FFFF}]/gu, '')
     .replace(/[\u{2600}-\u{27BF}]/gu, '')
     .replace(/[\uFE00-\uFE0F]/g, '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    // إزالة رموز خاصة
     .replace(/[#*_~`|\\<>{}[\]]/g, '')
-    // تنظيف المسافات الزائدة
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -841,10 +874,6 @@ function bindEvents() {
   updateSendBtn();
 }
 
-
-
-
-
 // تسجيل الـ Service Worker لتفعيل الـ PWA
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
@@ -853,5 +882,3 @@ if ('serviceWorker' in navigator) {
       .catch(err => console.log('فشل تسجيل الـ Service Worker:', err));
   });
 }
-
-
