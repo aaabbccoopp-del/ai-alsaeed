@@ -23,22 +23,24 @@ const SYSTEM_PROMPT = `أنت السعيد AI، مساعد ذكي وودود ت�
 const CONTACT_KEYWORDS = ['تواصل','واتساب','whatsapp','اتصل','ابعت','contact'];
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let sessions     = loadSessions();
-let activeId     = null;
-let isLoading    = false;
-let abortCtrl    = null;
-let isListening  = false;
-let recognition  = null;
-let isSpeaking   = false;
-let currentUtter = null;
+let sessions        = loadSessions();
+let activeId        = null;
+let isLoading       = false;
+let abortCtrl       = null;
+let isListening     = false;
+let recognition     = null;
+let isSpeaking      = false;
+let currentUtter    = null;   // kept for compatibility
+let currentChatAudio = null;  // Pollinations TTS audio (chat)
+let currentCallAudio = null;  // Pollinations TTS audio (call)
 
 // ── Call State ──
-let callActive    = false;
-let callMuted     = false;
-let callTimerRef  = null;
-let callSeconds   = 0;
-let callRecog     = null;
-let callMessages  = [];    // separate history for voice call
+let callActive     = false;
+let callMuted      = false;
+let callTimerRef   = null;
+let callSeconds    = 0;
+let callRecog      = null;
+let callMessages   = [];    // separate history for voice call
 let callProcessing = false;
 
 // ─── DOM ──────────────────────────────────────────────────────────────────────
@@ -268,10 +270,20 @@ function createStreamingBubble() {
   messagesList.appendChild(row);
   scrollToBottom();
 }
+
+// ─── أثناء الـ Stream: تحديث النص الخام بسرعة بدون renderMarkdown ──────────
 function updateStreamBubble(text) {
   const el = $('#streamBubble');
-  if (el) { el.innerHTML = renderMarkdown(text) + '<span class="cursor-blink">|</span>'; scrollToBottom(); }
+  if (!el) return;
+  el.textContent = text;
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor-blink';
+  cursor.textContent = '|';
+  el.appendChild(cursor);
+  scrollToBottom();
 }
+
+// ─── بعد انتهاء الـ Stream: تطبيق renderMarkdown مرة واحدة فقط ─────────────
 function finalizeStreamBubble(text, msgId) {
   const row = $('#streamRow');
   if (!row) return;
@@ -345,7 +357,8 @@ async function sendMessage(customText) {
         model: 'openai', stream: true,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          ...session.messages.slice(-14).map(m => ({ role: m.role, content: m.content }))
+          // ─── إرسال آخر 8 رسائل فقط لتقليل الـ Payload وتسريع الاستجابة ───
+          ...session.messages.slice(-8).map(m => ({ role: m.role, content: m.content }))
         ]
       })
     });
@@ -414,10 +427,9 @@ function startCall() {
   setCallStatus('🔄 جاري الاتصال بالسعيد AI...');
   setWaveMode('idle');
 
-  // Greet after short delay
   setTimeout(async () => {
     const greeting = 'أهلاً! أنا السعيد AI 😊 تكلم وأنا هرد عليك. قل "إنهاء" لإنهاء المكالمة.';
-    setCallStatus('🤖 السعيد AI يتكلم...');
+    setCallStatus('🤖 السعيد يتحدث...');
     setAITranscript(greeting);
     setWaveMode('speaking');
     animateCallAvatar(true);
@@ -432,7 +444,12 @@ function endCall() {
   callActive = false;
   stopCallTimer();
   stopCallListening();
-  window.speechSynthesis?.cancel();
+  // ─── إيقاف صوت Pollinations TTS إن كان يعمل ───
+  if (currentCallAudio) {
+    currentCallAudio.pause();
+    currentCallAudio.src = '';
+    currentCallAudio = null;
+  }
   callOverlay.classList.remove('active');
   setWaveMode('idle');
   animateCallAvatar(false);
@@ -474,7 +491,6 @@ function startCallListening() {
     const finalText = interimText.trim();
     if (!finalText) { if (callActive && !callMuted) setTimeout(() => startCallListening(), 500); return; }
 
-    // Check for end call commands
     if (/إنهاء|أنهي|انهي|وداعاً|وداع|باي|bye|end call/i.test(finalText)) {
       setCallStatus('😊 إلى اللقاء! شكراً لك.');
       setAITranscript('إلى اللقاء! شكراً لتحدثك معي 😊');
@@ -490,12 +506,12 @@ function startCallListening() {
 
     try {
       callMessages.push({ role: 'user', content: finalText });
-      const reply = await fetchAIForCall(callMessages.slice(-10));
+      const reply = await fetchAIForCall(callMessages.slice(-8));
       if (!callActive) return;
       callMessages.push({ role: 'assistant', content: reply });
 
       setAITranscript(reply);
-      setCallStatus('🤖 السعيد AI يتكلم...');
+      setCallStatus('🤖 السعيد يتحدث...');
       setWaveMode('speaking');
       animateCallAvatar(true);
 
@@ -543,25 +559,48 @@ async function fetchAIForCall(messages) {
   return await readStream(res, () => {});
 }
 
+// ─── Pollinations TTS — صوت المكالمة ─────────────────────────────────────────
 function speakCallText(text) {
   return new Promise((resolve) => {
-    if (!window.speechSynthesis) { resolve(); return; }
-    window.speechSynthesis.cancel();
+    // إيقاف أي صوت سابق
+    if (currentCallAudio) {
+      currentCallAudio.pause();
+      currentCallAudio.src = '';
+      currentCallAudio = null;
+    }
 
-    const cleanText = stripMarkdown(text);
-    const utter = new SpeechSynthesisUtterance(cleanText);
-    utter.lang = 'ar-EG';
-    utter.rate = 1.0;
-    utter.pitch = 1.05;
-    utter.volume = 1;
+    const cleanText = cleanTextForTTS(text);
+    if (!cleanText) { resolve(); return; }
 
-    const voices = window.speechSynthesis.getVoices();
-    const arVoice = voices.find(v => v.lang.startsWith('ar')) || voices.find(v => v.lang.includes('ar'));
-    if (arVoice) utter.voice = arVoice;
+    const audio = new Audio(
+      `https://tts.pollinations.ai/?text=${encodeURIComponent(cleanText)}&voice=ar-EG`
+    );
+    currentCallAudio = audio;
 
-    utter.onend  = resolve;
-    utter.onerror = resolve;
-    window.speechSynthesis.speak(utter);
+    audio.onplay = () => {
+      setWaveMode('speaking');
+      setCallStatus('🤖 السعيد يتحدث...');
+      animateCallAvatar(true);
+    };
+
+    audio.onended = () => {
+      currentCallAudio = null;
+      animateCallAvatar(false);
+      setWaveMode('idle');
+      resolve();
+    };
+
+    audio.onerror = () => {
+      currentCallAudio = null;
+      animateCallAvatar(false);
+      setWaveMode('idle');
+      resolve();
+    };
+
+    audio.play().catch(() => {
+      currentCallAudio = null;
+      resolve();
+    });
   });
 }
 
@@ -616,23 +655,72 @@ function stopCallTimer() {
   callTimerEl.textContent = '00:00';
 }
 
-// ─── Text-to-Speech (chat messages) ──────────────────────────────────────────
+// ─── Pollinations TTS — صوت رسائل الشات (زر استمع) ──────────────────────────
 function speakText(text, btn) {
-  if (!window.speechSynthesis) { alert('المتصفح لا يدعم القراءة الصوتية'); return; }
+  // إذا كان هناك صوت يعمل، أوقفه
   if (isSpeaking) {
-    window.speechSynthesis.cancel(); isSpeaking = false;
-    document.querySelectorAll('.speak-btn.speaking').forEach(b => { b.textContent = '🔊 استمع'; b.classList.remove('speaking'); });
-    if (currentUtter?._btn === btn) return;
+    const prevBtn = currentChatAudio?._btn;
+    if (currentChatAudio) {
+      currentChatAudio.pause();
+      currentChatAudio.src = '';
+    }
+    currentChatAudio = null;
+    isSpeaking = false;
+    document.querySelectorAll('.speak-btn.speaking').forEach(b => {
+      b.textContent = '🔊 استمع'; b.classList.remove('speaking');
+    });
+    // إذا الضغطة على نفس الزر → فقط إيقاف (Toggle Off)
+    if (prevBtn === btn) return;
   }
-  const utter = new SpeechSynthesisUtterance(stripMarkdown(text));
-  utter._btn = btn; utter.lang = 'ar-EG'; utter.rate = 0.95; utter.pitch = 1.05;
-  const voices = window.speechSynthesis.getVoices();
-  const arVoice = voices.find(v => v.lang.startsWith('ar'));
-  if (arVoice) utter.voice = arVoice;
-  utter.onstart = () => { isSpeaking = true; btn.textContent = '⏹ إيقاف'; btn.classList.add('speaking'); };
-  utter.onend = utter.onerror = () => { isSpeaking = false; btn.textContent = '🔊 استمع'; btn.classList.remove('speaking'); };
-  currentUtter = utter;
-  window.speechSynthesis.speak(utter);
+
+  const cleanText = cleanTextForTTS(text);
+  if (!cleanText) return;
+
+  const audio = new Audio(
+    `https://tts.pollinations.ai/?text=${encodeURIComponent(cleanText)}&voice=ar-EG`
+  );
+  audio._btn = btn;
+  currentChatAudio = audio;
+
+  audio.onplay = () => {
+    isSpeaking = true;
+    btn.textContent = '⏹ إيقاف';
+    btn.classList.add('speaking');
+  };
+
+  audio.onended = () => {
+    isSpeaking = false;
+    currentChatAudio = null;
+    btn.textContent = '🔊 استمع';
+    btn.classList.remove('speaking');
+  };
+
+  audio.onerror = () => {
+    isSpeaking = false;
+    currentChatAudio = null;
+    btn.textContent = '🔊 استمع';
+    btn.classList.remove('speaking');
+  };
+
+  audio.play().catch(() => {
+    isSpeaking = false;
+    currentChatAudio = null;
+  });
+}
+
+// ─── تنظيف النص للـ TTS: إزالة الإيموجيز والرموز الغريبة ─────────────────────
+function cleanTextForTTS(text) {
+  return stripMarkdown(text)
+    // إزالة الإيموجيز (Emoji Unicode ranges)
+    .replace(/[\u{1F000}-\u{1FFFF}]/gu, '')
+    .replace(/[\u{2600}-\u{27BF}]/gu, '')
+    .replace(/[\uFE00-\uFE0F]/g, '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    // إزالة رموز خاصة
+    .replace(/[#*_~`|\\<>{}[\]]/g, '')
+    // تنظيف المسافات الزائدة
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // ─── Voice Input (text box mic) ───────────────────────────────────────────────
@@ -750,18 +838,8 @@ function bindEvents() {
     if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); newChat(); }
   });
 
-  window.speechSynthesis?.addEventListener('voiceschanged', () => {});
   updateSendBtn();
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -775,3 +853,5 @@ if ('serviceWorker' in navigator) {
       .catch(err => console.log('فشل تسجيل الـ Service Worker:', err));
   });
 }
+
+
