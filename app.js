@@ -753,3 +753,25 @@ function bindEvents() {
   window.speechSynthesis?.addEventListener('voiceschanged', () => {});
   updateSendBtn();
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// تسجيل الـ Service Worker لتفعيل الـ PWA
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js')
+      .then(reg => console.log('تم تسجيل الـ Service Worker بنجاح!', reg))
+      .catch(err => console.log('فشل تسجيل الـ Service Worker:', err));
+  });
+}
