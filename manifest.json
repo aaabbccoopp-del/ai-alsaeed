@@ -1,0 +1,22 @@
+{
+  "short_name": "السعيد AI",
+  "name": "السعيد AI — مساعدك الذكي",
+  "icons": [
+    {
+      "src": "avatar.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "avatar.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "./index.html",
+  "background_color": "#f0f4ff",
+  "theme_color": "#4f6ef7",
+  "display": "standalone",
+  "orientation": "portrait"
+}
+
